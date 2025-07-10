@@ -1,25 +1,54 @@
-// src/components/GLBViewer.jsx
 import React, { Suspense, useEffect, useRef, useState } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 
-// Load and parse model
-const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
+// Define component type matchers
+const MODEL_COMPONENT_TYPES = [
+  { label: "Windows", key: "window", patterns: [/window/i, /win/i] },
+  { label: "Doors", key: "door", patterns: [/door/i, /dr/i] },
+];
+
+// Helper: walk up the parent chain and check name/userData.name
+function matchesAnyPattern(node, patterns) {
+  let curr = node;
+  while (curr) {
+    const toTest = [
+      curr.name || "",
+      curr.userData?.name || ""
+    ];
+    if (toTest.some(str =>
+      patterns.some(pattern => pattern.test(str))
+    )) {
+      return true;
+    }
+    curr = curr.parent;
+  }
+  return false;
+}
+
+const Model = ({
+  url,
+  onFloorsDetected,
+  onModelBounds,
+  highlightedFloor,
+  highlightedComponentType,
+  setComponentTypes,
+}) => {
   const { scene } = useGLTF(url);
   const originalMaterials = useRef(new Map());
-  const floorComponents = useRef(new Map()); // Store all components for each floor
+  const floorComponents = useRef(new Map());
 
   useEffect(() => {
     const floorNodes = [];
     const allNodes = [];
+    const typeNodesMap = new Map();
 
-    // Collect all nodes and identify floor nodes
+    // Traverse scene and collect everything
     scene.traverse((node) => {
       if (node.isMesh) {
         allNodes.push(node);
 
-        // Store original material for all nodes
         if (!originalMaterials.current.has(node.uuid)) {
           originalMaterials.current.set(node.uuid, node.material);
         }
@@ -27,16 +56,30 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
         if (node.name.toLowerCase().includes("floor")) {
           floorNodes.push(node);
         }
+
+        // Check mesh itself, parent chain, AND userData for each type
+        MODEL_COMPONENT_TYPES.forEach((type) => {
+          if (matchesAnyPattern(node, type.patterns)) {
+            if (!typeNodesMap.has(type.key)) typeNodesMap.set(type.key, []);
+            typeNodesMap.get(type.key).push(node);
+          }
+        });
       }
     });
 
-    // Sort floors by name to ensure consistent ordering
-    floorNodes.sort((a, b) => a.name.localeCompare(b.name));
+    setComponentTypes(
+      MODEL_COMPONENT_TYPES
+        .filter((type) => typeNodesMap.get(type.key)?.length)
+        .map((type) => ({
+          label: type.label,
+          key: type.key,
+          nodes: typeNodesMap.get(type.key),
+        }))
+    );
 
-    // Create a map to handle duplicate names and group related floor parts
+    floorNodes.sort((a, b) => a.name.localeCompare(b.name));
     const floorMap = new Map();
     floorNodes.forEach((node) => {
-      // Try to extract floor number from various naming patterns
       const floorMatch =
         node.name.match(/floor[\s_-]*(\d+)/i) ||
         node.name.match(/(\d+)(?:st|nd|rd|th)?[\s_-]*floor/i) ||
@@ -47,7 +90,6 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
       if (floorMatch) {
         key = `floor_${floorMatch[1]}`;
       } else {
-        // If no number found, use the full name as key
         key = node.name.toLowerCase();
       }
 
@@ -58,26 +100,28 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
           floorNumber: floorMatch ? parseInt(floorMatch[1]) : null,
         });
       } else {
-        // Add to existing floor group (for floors with multiple parts)
         floorMap.get(key).nodes.push(node);
       }
     });
 
-    // Now group ALL nodes by floor based on naming patterns and Y-position
     const floorComponentsMap = new Map();
+    const assignedNodes = new Set();
 
     Array.from(floorMap.keys()).forEach((floorKey) => {
       const floorData = floorMap.get(floorKey);
       const floorNumber = floorData.floorNumber;
+      const relatedNodes = [];
 
-      // Find all nodes that belong to this floor
-      const relatedNodes = allNodes.filter((node) => {
+      allNodes.forEach((node) => {
+        if (assignedNodes.has(node.uuid)) return;
+
         const nodeName = node.name.toLowerCase();
+        let matched = false;
 
-        // Check if node name contains floor identifier
-        const hasFloorInName =
+        if (
           floorNumber &&
-          (nodeName.includes(`floor${floorNumber}`) ||
+          (
+            nodeName.includes(`floor${floorNumber}`) ||
             nodeName.includes(`floor_${floorNumber}`) ||
             nodeName.includes(`floor ${floorNumber}`) ||
             nodeName.includes(`level${floorNumber}`) ||
@@ -87,39 +131,45 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
             nodeName.includes(`f${floorNumber}`) ||
             nodeName.match(
               new RegExp(`${floorNumber}(?:st|nd|rd|th)?[\\s_-]*floor`, "i")
-            ));
+            )
+          )
+        ) {
+          matched = true;
+        }
 
-        if (hasFloorInName) return true;
+        if (!matched) {
+          const floorBoundingBox = new THREE.Box3();
+          floorData.nodes.forEach((floorNode) => {
+            const nodeBox = new THREE.Box3().setFromObject(floorNode);
+            floorBoundingBox.union(nodeBox);
+          });
 
-        // Also check for nodes that might be grouped by Y-position
-        // (this is more complex and depends on your model structure)
-        const floorBoundingBox = new THREE.Box3();
-        floorData.nodes.forEach((floorNode) => {
-          const nodeBox = new THREE.Box3().setFromObject(floorNode);
-          floorBoundingBox.union(nodeBox);
-        });
+          const nodeBox = new THREE.Box3().setFromObject(node);
+          const nodeCenter = new THREE.Vector3();
+          nodeBox.getCenter(nodeCenter);
 
-        const nodeBox = new THREE.Box3().setFromObject(node);
-        const nodeCenter = new THREE.Vector3();
-        nodeBox.getCenter(nodeCenter);
+          const floorCenter = new THREE.Vector3();
+          floorBoundingBox.getCenter(floorCenter);
 
-        const floorCenter = new THREE.Vector3();
-        floorBoundingBox.getCenter(floorCenter);
+          const yTolerance = floorBoundingBox.max.y - floorBoundingBox.min.y + 5;
+          const yDifference = Math.abs(nodeCenter.y - floorCenter.y);
 
-        // Check if node is within reasonable Y range of the floor
-        const yTolerance = floorBoundingBox.max.y - floorBoundingBox.min.y + 5; // Allow some height variation
-        const yDifference = Math.abs(nodeCenter.y - floorCenter.y);
+          if (yDifference <= yTolerance) {
+            matched = true;
+          }
+        }
 
-        return yDifference <= yTolerance;
+        if (matched) {
+          assignedNodes.add(node.uuid);
+          relatedNodes.push(node);
+        }
       });
 
       floorComponentsMap.set(floorKey, relatedNodes);
     });
 
-    // Store the floor components mapping
     floorComponents.current = floorComponentsMap;
 
-    // Convert to array and sort by floor number
     const floorEntries = Array.from(floorMap.entries()).sort((a, b) => {
       const aNum = a[1].floorNumber;
       const bNum = b[1].floorNumber;
@@ -134,27 +184,15 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
         ? `floor ${floorData.floorNumber}`
         : `floor ${index + 1}`,
       value: key,
-      node: floorData.nodes[0], // Use the first node for positioning
-      nodes: floorData.nodes, // Keep all nodes for potential highlighting
-      allComponents: floorComponentsMap.get(key) || floorData.nodes, // All components for highlighting
+      node: floorData.nodes[0],
+      nodes: floorData.nodes,
+      allComponents: floorComponentsMap.get(key) || floorData.nodes,
       originalName: floorData.name,
     }));
 
     onFloorsDetected(uniqueFloors);
 
-    // Debug: Log detected floors
-    console.log(
-      "Detected floors:",
-      uniqueFloors.map((f) => ({
-        label: f.label,
-        value: f.value,
-        originalName: f.originalName,
-        nodeCount: f.nodes.length,
-        totalComponents: f.allComponents.length,
-      }))
-    );
-
-    // Get overall model bounds
+    // Model bounds
     const boundingBox = new THREE.Box3().setFromObject(scene);
     const center = new THREE.Vector3();
     const size = new THREE.Vector3();
@@ -162,11 +200,9 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
     boundingBox.getSize(size);
 
     onModelBounds({ center, size });
-  }, [scene, onFloorsDetected, onModelBounds]);
+  }, [scene, onFloorsDetected, onModelBounds, setComponentTypes]);
 
-  // Handle floor highlighting
   useEffect(() => {
-    // Reset all materials to original
     scene.traverse((node) => {
       if (node.isMesh) {
         const originalMaterial = originalMaterials.current.get(node.uuid);
@@ -176,131 +212,63 @@ const Model = ({ url, onFloorsDetected, onModelBounds, highlightedFloor }) => {
       }
     });
 
-    // Apply highlight to selected floor (all components)
     if (highlightedFloor?.allComponents) {
       const highlightMaterial = new THREE.MeshBasicMaterial({
-        color: 0xff6b35, // Orange highlight color
+        color: 0xff6b35,
         transparent: true,
         opacity: 0.7,
       });
-
-      console.log(
-        `Highlighting ${highlightedFloor.allComponents.length} components for ${highlightedFloor.label}`
-      );
-
       highlightedFloor.allComponents.forEach((node) => {
-        if (node.isMesh) {
-          node.material = highlightMaterial;
-        }
+        if (node.isMesh) node.material = highlightMaterial;
       });
     }
-  }, [scene, highlightedFloor]);
+
+    if (highlightedComponentType?.nodes?.length) {
+      const highlightMaterial = new THREE.MeshBasicMaterial({
+        color: 0x36a2eb,
+        transparent: true,
+        opacity: 0.7,
+      });
+      highlightedComponentType.nodes.forEach((node) => {
+        if (node.isMesh) node.material = highlightMaterial;
+      });
+    }
+  }, [scene, highlightedFloor, highlightedComponentType]);
 
   return <primitive object={scene} />;
 };
 
-// Controls scene + camera
 const SceneWrapper = ({
   modelPath,
   setFloors,
   selectedFloor,
   highlightedFloor,
+  highlightedComponentType,
   modelBounds,
   setModelBounds,
+  setComponentTypes,
 }) => {
   const { camera } = useThree();
   const controlsRef = useRef();
   const [hasInitialized, setHasInitialized] = useState(false);
 
-  // Initial positioning (only once when model loads)
   useEffect(() => {
     if (modelBounds && !hasInitialized) {
       const { center, size } = modelBounds;
 
-      // Set initial camera position
       camera.position.set(
         center.x,
         center.y + size.y / 2,
         center.z + size.z * 2
       );
 
-      // Set target for OrbitControls
       if (controlsRef.current) {
         controlsRef.current.target.set(center.x, center.y, center.z);
         controlsRef.current.update();
       }
-
       setHasInitialized(true);
     }
   }, [modelBounds, hasInitialized, camera]);
-
-  // Animate to selected floor (smooth transition)
-  useEffect(() => {
-    if (selectedFloor?.node && controlsRef.current && hasInitialized) {
-      // Calculate bounding box for all nodes of the selected floor
-      const box = new THREE.Box3();
-
-      if (selectedFloor.nodes && selectedFloor.nodes.length > 1) {
-        // If multiple nodes, calculate combined bounding box
-        selectedFloor.nodes.forEach((node) => {
-          const nodeBox = new THREE.Box3().setFromObject(node);
-          box.union(nodeBox);
-        });
-      } else {
-        // Single node
-        box.setFromObject(selectedFloor.node);
-      }
-
-      const center = new THREE.Vector3();
-      const size = new THREE.Vector3();
-      box.getCenter(center);
-      box.getSize(size);
-
-      // Calculate optimal camera position for the floor
-      const distance = Math.max(size.x, size.y, size.z) * 1.5;
-      const targetPosition = new THREE.Vector3(
-        center.x + distance * 0.7,
-        center.y + distance * 0.7,
-        center.z + distance * 0.7
-      );
-
-      // Debug: Log floor selection info
-      console.log("Selected floor:", {
-        label: selectedFloor.label,
-        center: center.toArray(),
-        size: size.toArray(),
-        nodeCount: selectedFloor.nodes?.length || 1,
-      });
-
-      // Smoothly animate to the new position
-      const startPosition = camera.position.clone();
-      const startTarget = controlsRef.current.target.clone();
-
-      let progress = 0;
-      const animationSpeed = 0.02;
-
-      const animate = () => {
-        progress += animationSpeed;
-
-        if (progress >= 1) {
-          // Animation complete
-          camera.position.copy(targetPosition);
-          controlsRef.current.target.copy(center);
-          controlsRef.current.update();
-          return;
-        }
-
-        // Interpolate position and target
-        camera.position.lerpVectors(startPosition, targetPosition, progress);
-        controlsRef.current.target.lerpVectors(startTarget, center, progress);
-        controlsRef.current.update();
-
-        requestAnimationFrame(animate);
-      };
-
-      animate();
-    }
-  }, [selectedFloor, camera, hasInitialized]);
 
   return (
     <>
@@ -312,6 +280,8 @@ const SceneWrapper = ({
           onFloorsDetected={setFloors}
           onModelBounds={setModelBounds}
           highlightedFloor={highlightedFloor}
+          highlightedComponentType={highlightedComponentType}
+          setComponentTypes={setComponentTypes}
         />
       </Suspense>
       <OrbitControls
@@ -328,15 +298,36 @@ const SceneWrapper = ({
   );
 };
 
-// Main Viewer
 const GLBViewer = ({ modelPath }) => {
   const [floors, setFloors] = useState([]);
   const [selectedFloor, setSelectedFloor] = useState(null);
   const [highlightedFloor, setHighlightedFloor] = useState(null);
+  const [highlightedComponentType, setHighlightedComponentType] = useState(null);
+  const [componentTypes, setComponentTypes] = useState([]);
   const [modelBounds, setModelBounds] = useState(null);
 
+  useEffect(() => {
+    if (highlightedFloor) setHighlightedComponentType(null);
+  }, [highlightedFloor]);
+  useEffect(() => {
+    if (highlightedComponentType) setHighlightedFloor(null);
+  }, [highlightedComponentType]);
+
+  const startVR = () => {
+    // Enable VR with WebXR API using WebGLRenderer
+    const renderer = new THREE.WebGLRenderer();
+    renderer.xr.enabled = true; // Enable WebXR for VR
+
+    // Create a button to trigger VR mode manually
+    const vrButton = new THREE.VRButton(renderer);
+    document.body.appendChild(vrButton.domElement); // Append VRButton to the DOM
+    vrButton.addEventListener("click", () => {
+      renderer.xr.getSession().start(); // Start the VR session
+    });
+  };
+
   return (
-    <div style={{ height: "100vh", width: "100vw", position: "relative" }}>
+    <div style={{ height: "90vh", width: "100vw", position: "relative" }}>
       {/* UI Dropdowns */}
       <div style={{ position: "absolute", top: 20, left: 20, zIndex: 10 }}>
         <div style={{ marginBottom: "10px" }}>
@@ -344,7 +335,7 @@ const GLBViewer = ({ modelPath }) => {
             style={{
               display: "block",
               marginBottom: "5px",
-              color: "black",
+              color: "white",
               fontSize: "14px",
             }}
           >
@@ -357,6 +348,7 @@ const GLBViewer = ({ modelPath }) => {
               setSelectedFloor(selected);
             }}
             style={{ width: "150px" }}
+            value={selectedFloor?.value || ""}
           >
             <option value="">Select Floor</option>
             {floors.map((floor) => (
@@ -372,7 +364,7 @@ const GLBViewer = ({ modelPath }) => {
             style={{
               display: "block",
               marginBottom: "5px",
-              color: "black",
+              color: "white",
               fontSize: "14px",
             }}
           >
@@ -385,6 +377,7 @@ const GLBViewer = ({ modelPath }) => {
               setHighlightedFloor(selected);
             }}
             style={{ width: "150px" }}
+            value={highlightedFloor?.value || ""}
           >
             <option value="">No Highlight</option>
             {floors.map((floor) => (
@@ -394,17 +387,71 @@ const GLBViewer = ({ modelPath }) => {
             ))}
           </select>
         </div>
+
+        {/* NEW: Dropdown for Windows/Doors/other types */}
+        <div style={{ marginTop: "18px" }}>
+          <label
+            style={{
+              display: "block",
+              marginBottom: "5px",
+              color: "white",
+              fontSize: "14px",
+            }}
+          >
+            Highlight Type:
+          </label>
+          <select
+            className="p-2 border rounded bg-white text-black"
+            onChange={(e) => {
+              const selected = componentTypes.find((t) => t.key === e.target.value);
+              setHighlightedComponentType(selected || null);
+            }}
+            style={{ width: "150px" }}
+            value={highlightedComponentType?.key || ""}
+          >
+            <option value="">No Highlight</option>
+            {componentTypes.length === 0 && (
+              <option value="" disabled>
+                No Types Found
+              </option>
+            )}
+            {componentTypes.map((type) => (
+              <option key={type.key} value={type.key}>
+                {type.label} ({type.nodes.length})
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
+      {/* VR Button placed outside Canvas */}
+      <button
+      id="button"
+        onClick={startVR}
+        style={{
+          position: "absolute",
+          top: "20px",
+          right: "20px",
+          padding: "10px",
+          background: "#ff6b35",
+          color: "white",
+          borderRadius: "5px",
+        }}
+      >
+        Enter VR Mode
+      </button>
+
       {/* Canvas */}
-      <Canvas camera={{ position: [0, 0, 0], fov: 60 }}>
+      <Canvas camera={{ position: [0, 0, 0], fov: 60 }} xr={{ enabled: true }}>
         <SceneWrapper
           modelPath={modelPath}
           setFloors={setFloors}
           selectedFloor={selectedFloor}
           highlightedFloor={highlightedFloor}
+          highlightedComponentType={highlightedComponentType}
           modelBounds={modelBounds}
           setModelBounds={setModelBounds}
+          setComponentTypes={setComponentTypes}
         />
       </Canvas>
     </div>
