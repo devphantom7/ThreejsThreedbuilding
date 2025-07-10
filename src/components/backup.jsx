@@ -49,6 +49,14 @@ const Model = ({
       if (node.isMesh) {
         allNodes.push(node);
 
+        // Log for debug: show mesh name, parent name, userData
+        console.log(
+          "Mesh:",
+          node.name,
+          "| Parent:", node.parent?.name,
+          "| userData:", node.userData?.name
+        );
+
         if (!originalMaterials.current.has(node.uuid)) {
           originalMaterials.current.set(node.uuid, node.material);
         }
@@ -57,7 +65,7 @@ const Model = ({
           floorNodes.push(node);
         }
 
-        // Check mesh itself, parent chain, AND userData for each type
+        // NEW: check mesh itself, parent chain, AND userData for each type
         MODEL_COMPONENT_TYPES.forEach((type) => {
           if (matchesAnyPattern(node, type.patterns)) {
             if (!typeNodesMap.has(type.key)) typeNodesMap.set(type.key, []);
@@ -77,6 +85,7 @@ const Model = ({
         }))
     );
 
+    // ---- Floor logic unchanged ----
     floorNodes.sort((a, b) => a.name.localeCompare(b.name));
     const floorMap = new Map();
     floorNodes.forEach((node) => {
@@ -270,6 +279,58 @@ const SceneWrapper = ({
     }
   }, [modelBounds, hasInitialized, camera]);
 
+  useEffect(() => {
+    if (selectedFloor?.node && controlsRef.current && hasInitialized) {
+      const box = new THREE.Box3();
+
+      if (selectedFloor.nodes && selectedFloor.nodes.length > 1) {
+        selectedFloor.nodes.forEach((node) => {
+          const nodeBox = new THREE.Box3().setFromObject(node);
+          box.union(nodeBox);
+        });
+      } else {
+        box.setFromObject(selectedFloor.node);
+      }
+
+      const center = new THREE.Vector3();
+      const size = new THREE.Vector3();
+      box.getCenter(center);
+      box.getSize(size);
+
+      const distance = Math.max(size.x, size.y, size.z) * 1.5;
+      const targetPosition = new THREE.Vector3(
+        center.x + distance * 0.7,
+        center.y + distance * 0.7,
+        center.z + distance * 0.7
+      );
+
+      const startPosition = camera.position.clone();
+      const startTarget = controlsRef.current.target.clone();
+
+      let progress = 0;
+      const animationSpeed = 0.02;
+
+      const animate = () => {
+        progress += animationSpeed;
+
+        if (progress >= 1) {
+          camera.position.copy(targetPosition);
+          controlsRef.current.target.copy(center);
+          controlsRef.current.update();
+          return;
+        }
+
+        camera.position.lerpVectors(startPosition, targetPosition, progress);
+        controlsRef.current.target.lerpVectors(startTarget, center, progress);
+        controlsRef.current.update();
+
+        requestAnimationFrame(animate);
+      };
+
+      animate();
+    }
+  }, [selectedFloor, camera, hasInitialized]);
+
   return (
     <>
       <ambientLight intensity={0.5} />
@@ -312,22 +373,6 @@ const GLBViewer = ({ modelPath }) => {
   useEffect(() => {
     if (highlightedComponentType) setHighlightedFloor(null);
   }, [highlightedComponentType]);
-
-  const startVR = () => {
-    // Enable WebXR for VR mode
-    const renderer = new THREE.WebGLRenderer();
-    renderer.xr.enabled = true; // Enable WebXR for VR
-
-    // Creating the VR button
-    const vrButton = document.createElement("button");
-    vrButton.innerText = "Enter VR";
-    document.body.appendChild(vrButton);
-
-    vrButton.onclick = () => {
-      // Trigger WebXR session manually
-      renderer.xr.getSession().start();
-    };
-  };
 
   return (
     <div style={{ height: "90vh", width: "100vw", position: "relative" }}>
@@ -427,24 +472,8 @@ const GLBViewer = ({ modelPath }) => {
         </div>
       </div>
 
-      {/* VR Button placed outside Canvas */}
-      <button
-        onClick={startVR}
-        style={{
-          position: "absolute",
-          top: "20px",
-          right: "20px",
-          padding: "10px",
-          background: "#ff6b35",
-          color: "white",
-          borderRadius: "5px",
-        }}
-      >
-        Enter VR Mode
-      </button>
-
       {/* Canvas */}
-      <Canvas camera={{ position: [0, 0, 0], fov: 60 }} xr={{ enabled: true }}>
+      <Canvas camera={{ position: [0, 0, 0], fov: 60 }}>
         <SceneWrapper
           modelPath={modelPath}
           setFloors={setFloors}
